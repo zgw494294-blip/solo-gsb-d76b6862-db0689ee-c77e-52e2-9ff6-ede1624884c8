@@ -1,0 +1,201 @@
+# SQLite 事务隔离实验室
+
+一个用于观察 SQLite（WAL 模式）事务隔离与写锁冲突行为的网页实验台。
+
+- 后端：Python + Flask（直接调用标准库 `sqlite3`，真实执行 SQL）
+- 前端：原生 HTML / CSS / JavaScript，无任何框架
+- 每次「新建实验」都会得到一个独立的 WAL 数据库，内含单行整数值 `100`
+- 页面左右两栏（甲 / 乙）各自绑定一条**长期独立连接**，可执行
+  `BEGIN DEFERRED`、读值、加上输入整数、提交、回滚
+- 第三条连接单独显示**已提交值**
+- 状态刷新不执行任何 `SELECT`，不会为 DEFERRED 事务提前建立读快照
+- 写锁冲突立即返回 SQLite 错误名与错误码（`busy_timeout=0`），
+  不阻塞另一栏，也不会自动结束失败的事务
+- 写锁冲突（`SQLITE_BUSY`）发生时事务尚未建立读快照：对方 `COMMIT` 或
+  `ROLLBACK` 释放写锁后，**可在原事务直接重试写入**，无需回滚重开；
+  一旦本事务显式读值（读快照建立），再与对方新提交冲突则报
+  `SQLITE_BUSY_SNAPSHOT`，必须自行回滚重开（系统不代为回滚）
+- 「加上」的内部边界检查不会在本连接提前建立读快照：无快照时基于
+  observer 连接的已提交值预判，最终判定在 `UPDATE` 内的 `checked_add`
+  函数中完成，因此不会把 `SQLITE_BUSY` 误报成 `SQLITE_BUSY_SNAPSHOT`
+- 修改操作（加上）只允许在事务内进行，禁止事务外修改
+- 手动 **PASSIVE / TRUNCATE 检查点**按钮（也可 HTTP 调用）：每次用一条全新的
+  独立连接真实执行 `PRAGMA wal_checkpoint`，`busy_timeout=0`，读事务阻止回收时
+  立即返回 `busy=1`；各写连接已关闭自动检查点（`PRAGMA wal_autocheckpoint=0`）
+- 检查点结果显示模式与 SQLite 原始三项（**busy、WAL 总帧数、已回写帧数**）及
+  操作后 WAL 文件字节数（文件不存在记 0）；状态刷新只读内存缓存，不触发检查点
+- 检查点不代替两栏提交 / 回滚，也不替换任何连接
+- 页面提供**删除当前实验**按钮（也可 HTTP 调用）：确认后删除。删除开始即等待
+  此前已进入的请求正常完成，期间该实验的操作、状态、已提交值与检查点**新请求
+  一律返回 410 Gone**；等待按实验独立，不阻塞其他实验。随后回滚两栏未提交事务、
+  关闭甲、乙长期连接与 observer 及一切临时检查点连接，再移除数据库与 `-wal`、
+  `-shm` 文件，全部完成才报告删除成功，因此在途检查点不可能在删除后重新创建文件
+- 本次运行中，已删除 ID 再次删除（或调用任何该实验接口）仍返回 **410**；
+  未知 ID 返回 **404**。页面收到删除成功或 410 后停止轮询、禁用旧实验的全部操作，
+  迟到响应不会恢复旧展示也不会自动新建实验；「新建实验」始终可手动使用
+- 实验仅保存在内存中，无需跨重启保留
+
+## 数值约定
+
+- 存储值为 SQLite 有符号 64 位整数（`-9223372036854775808` ～ `9223372036854775807`），
+  正负边界均不会转成浮点数
+- 单次增量上限为 ±2⁶²（`4611686018427387904`），超过即被 API 拒绝（`value too large`）
+- 累加结果若超出 64 位整数范围，该次「加上」会被拒绝（SQLite 对整数溢出不会报错，
+  而是静默存成 REAL，本实验在写入前做精确边界检查）；已开启的事务不受影响，
+  之前的修改保留，仍可提交或回滚
+- 传输编码：超出 JavaScript 安全整数范围（±2⁵³−1）的整数一律用十进制字符串传输，
+  范围内仍返回 JSON 数字；「加上」请求的 `value` 字段两种形式都接受，
+  旧的小整数数字请求照常可用
+- 输入、操作响应、状态轮询、最近一次显式读值、日志与已提交值均无损显示完整十进制值
+
+## 启动
+
+```bash
+docker compose up --build
+```
+
+访问：<http://localhost:8000>
+
+## 操作示例
+
+### 示例一：快照隔离与快照冲突（SQLITE_BUSY_SNAPSHOT）
+
+1. 甲：`BEGIN DEFERRED` → `读值` → 显示 **100**
+2. 乙：`BEGIN DEFERRED` → 输入 `10` → `加上` → `提交`
+   （顶部「已提交值」变为 **110**）
+3. 甲：`读值` → 仍为 **100**（甲的读快照不受乙已提交的修改影响）
+4. 甲：`加上` → 立即报错 **SQLITE_BUSY_SNAPSHOT（错误码 517）**，甲的事务仍然开启
+5. 甲：`回滚` → `BEGIN DEFERRED` → `读值` → 显示 **110**
+
+### 示例二：写锁冲突（SQLITE_BUSY）——提交释放写锁后在原事务重试
+
+1. 甲：`BEGIN DEFERRED` → 输入 `5` → `加上`（先不提交，甲持有写锁）
+2. 乙：`BEGIN DEFERRED`（不显式读值）→ 输入 `7` → `加上` →
+   立即报错 **SQLITE_BUSY（错误码 5）**，乙的事务不会被自动结束
+3. 甲：`提交`（释放写锁，已提交值变为 **105**）
+4. 乙：**在原事务中**再次输入 `7` → `加上` → 成功（不会报
+   SQLITE_BUSY_SNAPSHOT）→ `提交`（已提交值变为 **112**）
+
+> 修复前，「加上」内部的边界检查会先执行一条 SELECT，提前为乙建立读快照：
+> 第 2 步拿到 SQLITE_BUSY 后快照已经留下，第 4 步会被误报为
+> SQLITE_BUSY_SNAPSHOT（517）。现在内部检查不在乙的连接上读值，
+> 写锁冲突不建立读快照，原事务即可直接重试。
+
+若第 3 步甲改为 `回滚`，第 4 步乙重试并提交后值为 **107**（甲的 +5 被撤销）。
+
+### 示例二补充：显式读值后冲突 → 必须自行回滚重开（SQLITE_BUSY_SNAPSHOT）
+
+1. 乙：`BEGIN DEFERRED` → `读值` → 显示 **100**（读快照建立）
+2. 甲：`BEGIN DEFERRED` → 输入 `5` → `加上` → `提交`
+3. 乙：输入 `7` → `加上` → 立即报错 **SQLITE_BUSY_SNAPSHOT（错误码 517）**，
+   乙的事务仍开启，系统**不会**自动回滚、不替换连接、也不改变事务类型
+4. 乙：`回滚` → `BEGIN DEFERRED` → 输入 `7` → `加上` → `提交`
+   （已提交值变为 **112**）
+
+### 示例三：大整数精度（9007199254741093）
+
+1. 甲：`BEGIN DEFERRED` → 输入 `9007199254740993`（超出 JavaScript 安全整数范围，
+   前端会以十进制字符串发送）→ `加上` → `提交`
+2. 顶部「已提交值」显示 **9007199254741093**（= 100 + 9007199254740993，精确）
+3. 甲：`BEGIN DEFERRED` → `读值` → 同样显示 **9007199254741093**
+   （修复前因 `parseInt` 精度丢失会少 1，显示 9007199254741092）
+
+### 示例四：64 位溢出拒绝（不会存成 REAL）
+
+1. 甲：`BEGIN DEFERRED` → 输入 `4000000000000000000` → `加上` → 成功
+   （当前值 4000000000000000100）
+2. 甲：再次 `加上` → 成功（当前值 8000000000000000100）
+3. 甲：第三次 `加上` → 被拒绝：**累加结果超出有符号 64 位整数范围，本次未修改**
+   （修复前 SQLite 会静默存成浮点数 `1.2e+19`）
+4. 甲的事务仍然开启，前两次结果保留：可 `提交`
+   （已提交值变为 **8000000000000000100**），也可 `回滚`（已提交值保持 100）
+
+### 示例五：读事务阻止 WAL 回收（手动 PASSIVE / TRUNCATE 检查点）
+
+> 检查点每次由**独立的全新连接**真实执行 `PRAGMA wal_checkpoint(...)`，
+> `busy_timeout=0`；甲、乙两栏的写连接均已关闭自动检查点
+> （`PRAGMA wal_autocheckpoint=0`），不点击按钮 / 不调 HTTP 就不会发生检查点。
+> 返回值为 SQLite 原始三项：`busy`、`log`（WAL 总帧数）、
+> `checkpointed`（已回写帧数），另附操作后 WAL 文件字节数。
+
+1. 甲：`BEGIN DEFERRED` → `读值` → 显示 **100**（读事务建立读快照）
+2. 乙：`BEGIN DEFERRED` → 输入 `10` → `加上` → `提交`
+   （顶部「已提交值」变为 **110**，WAL 新增 1 帧）
+3. 点击 **PASSIVE 检查点** → 显示 **busy=0，WAL 总帧数=1，已回写帧数=0，
+   WAL=4152 字节，回写未完成（0/1 帧）**（4152 = 32 字节 WAL 头 + 24 字节帧头 +
+   4096 字节数据页，即默认页大小下的 1 帧；若页大小不同字节数相应变化）：
+   甲的读快照还停留在该帧之前，SQLite 不能把帧回写到主库，WAL 也不能被复用 / 截断
+4. 点击 **TRUNCATE 检查点** → **立即**返回 **busy=1，WAL 总帧数=1，
+   已回写帧数=0，WAL=4152 字节**（`busy_timeout=0` 不等待）；
+   甲此时再点 `读值` 仍为 **100**（检查点不改变甲的快照，也不提交 / 回滚甲的事务）
+5. 甲：`回滚`（读事务结束，不再有连接保留旧读快照）
+6. 再次点击 **TRUNCATE 检查点** → **busy=0，WAL 总帧数=0，已回写帧数=0，
+   WAL=0 字节**，即 SQLite 原始结果 `(0,0,0)`，WAL 文件被截断为 0 字节
+7. 顶部「已提交值」仍为 **110**：检查点只负责把已提交的帧搬回主库，
+   不会撤销乙的提交
+
+> 页面上的状态轮询只返回最近一次检查点结果的内存缓存，不执行任何 SQL、
+> 不触发检查点；检查点按钮请求进行中只禁用检查点按钮，甲、乙两栏照常操作。
+
+#### HTTP 调用示例
+
+检查点接口既接受路径参数，也接受 JSON body（模式大小写均可）：
+
+```bash
+EXP=<新建实验返回的 id>
+
+# PASSIVE 检查点（路径形式）
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/checkpoint/PASSIVE
+# {"busy":0,"checkpointed":0,"log_frames":1,"mode":"PASSIVE","ok":true,
+#  "wal_size":4152, ...}   读事务未结束时已回写帧数为 0，WAL 保持 4152 字节
+
+# TRUNCATE 检查点（JSON body 形式）
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/checkpoint \
+  -H 'Content-Type: application/json' -d '{"mode":"TRUNCATE"}'
+# 甲未回滚时：{"busy":1,"checkpointed":0,"log_frames":1,"wal_size":4152,...}
+# 甲回滚后：  {"busy":0,"checkpointed":0,"log_frames":0,"wal_size":0,...}
+```
+
+甲、乙两栏操作仍使用原接口，例如：
+
+```bash
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"read"}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"add","value":10}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"commit"}'
+curl -s -X POST http://localhost:8000/api/experiments/$EXP/conn/a/op \
+  -H 'Content-Type: application/json' -d '{"op":"rollback"}'
+```
+
+删除实验使用 `DELETE` 方法（页面上对应「删除当前实验」按钮，点击后需二次确认）：
+
+```bash
+EXP=<新建实验返回的 id>
+
+# 删除：等待在途请求完成 → 回滚未提交事务 → 关闭连接 → 删除 DB/WAL/SHM
+curl -s -X DELETE http://localhost:8000/api/experiments/$EXP
+# {"deleted":true,"id":"xxxxxxxxxxxx"}
+
+# 本次运行中再次删除同一 ID（以及该 ID 的任何接口）：410 Gone
+curl -s -o /dev/null -w "%{http_code}\n" -X DELETE \
+  http://localhost:8000/api/experiments/$EXP
+# 410
+
+# 从未存在过的 ID：404 Not Found
+curl -s -o /dev/null -w "%{http_code}\n" -X DELETE \
+  http://localhost:8000/api/experiments/does-not-exist
+# 404
+```
+
+> 删除等待期间该实验的新请求（操作 / 状态 / 已提交值 / 检查点）立即返回 **410**，
+> 已进入的请求正常完成；删除不会阻塞其他实验，未删除实验的甲、乙两栏仍可独立操作。
+> 页面收到删除成功或 410 后停止轮询并禁用旧实验操作，迟到响应不会恢复旧展示，
+> 也不会自动新建实验；需要时点击「新建实验」即可。
+
+> 提示：一栏的请求未完成时，该栏按钮会被禁用，另一栏仍可正常操作；
+> 两栏的状态轮询与「已提交值」均通过独立连接 / 内存状态完成，
+> 不会干扰甲、乙两栏各自的事务快照。
