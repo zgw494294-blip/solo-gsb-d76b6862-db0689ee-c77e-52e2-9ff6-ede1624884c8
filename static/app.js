@@ -7,6 +7,10 @@ let expGen = 1;
 // expFrozen：当前实验已删除，旧实验操作全部禁用，轮询停止；
 // 只有「新建实验」可以解除。
 let expFrozen = false;
+// creating：「新建实验」请求进行中。期间暂停旧轮询、禁用一切旧实验操作
+// 入口（定时器已清除，creating 再拦下已入队的迟到回调）；成功后只为新 ID
+// 启用控件与轮询，失败则按创建前状态回退（冻结页仍冻结、存活页恢复轮询）。
+let creating = false;
 let statusTimer = null;
 let committedTimer = null;
 // 404（服务端重启）后多个刷新可能同时到达：用单一在途 Promise 去重，
@@ -35,11 +39,9 @@ async function fetchJson(path, options) {
   return resp.json();
 }
 
-function freezeExperiment(reason) {
-  // 删除成功或收到 410：停止轮询并禁用全部旧实验操作。幂等。
-  if (expFrozen) return;
-  expFrozen = true;
-  expGen++; // 作废一切在途响应，迟到响应不再渲染 / 不再恢复按钮
+function stopPolling() {
+  // 清除两组轮询定时器。注意 clearInterval 不会撤销已经入队、即将执行的
+  // 回调，因此各回调入口还要再检查 creating / expFrozen。
   if (statusTimer !== null) {
     clearInterval(statusTimer);
     statusTimer = null;
@@ -48,6 +50,14 @@ function freezeExperiment(reason) {
     clearInterval(committedTimer);
     committedTimer = null;
   }
+}
+
+function freezeExperiment(reason) {
+  // 删除成功或收到 410：停止轮询并禁用全部旧实验操作。幂等。
+  if (expFrozen) return;
+  expFrozen = true;
+  expGen++; // 作废一切在途响应，迟到响应不再渲染 / 不再恢复按钮
+  stopPolling();
   setBusy("a", true);
   setBusy("b", true);
   setCheckpointBusy(true);
@@ -71,7 +81,14 @@ function newExperiment() {
 }
 
 async function createExperiment() {
+  const wasFrozen = expFrozen;
+  const oldId = expId;
+  const frozenNote = wasFrozen ? $("deleted-note").textContent : "";
   const gen = ++expGen;
+  // 创建期间：暂停旧实验轮询（creating 同时拦下已入队的迟到回调），
+  // 旧实验的操作入口全部保持禁用，创建成功前没有任何请求可以发到旧 ID。
+  creating = true;
+  stopPolling();
   // 解除旧实验冻结状态；创建请求完成前先保持控件禁用，
   // 避免在途点击把操作发到旧 expId。
   expFrozen = false;
@@ -87,23 +104,60 @@ async function createExperiment() {
   $("exp-id").textContent = "…";
   $("committed").textContent = "…";
 
-  let data;
-  try {
-    const resp = await fetch("/api/experiments", { method: "POST" });
-    data = await resp.json();
-  } catch (e) {
-    if (gen === expGen) {
-      showError("exp", { name: null, code: null, message: "新建实验失败：" + e.message });
+  const failCreate = (message) => {
+    if (gen !== expGen) return; // 期间又触发了新建 / 冻结
+    creating = false;
+    showError("exp", { name: null, code: null, message: "新建实验失败：" + message });
+    if (wasFrozen) {
+      // 从已删除页面发起的新建失败：旧操作仍禁用、轮询停止，
+      // 保持冻结页面，等待手动重试。
+      $("exp-id").textContent = oldId;
+      $("committed").textContent = "—";
+      freezeExperiment(frozenNote);
+    } else {
+      // 存活页面创建失败：恢复旧实验控件与轮询，错误显示在顶部。
+      if (oldId) {
+        expId = oldId;
+        history.replaceState(null, "", "?exp=" + expId);
+      } else {
+        history.replaceState(null, "", location.pathname);
+      }
+      $("exp-id").textContent = expId || "…";
+      $("committed").textContent = "—";
       setBusy("a", false);
       setBusy("b", false);
       setCheckpointBusy(false);
       $("refresh-committed").disabled = false;
       $("delete-exp").disabled = false;
+      // 立即拉一次旧实验状态，随后恢复轮询
+      if (oldId) {
+        refreshStatus(gen).catch(() => {});
+        refreshCommitted(gen).catch(() => {});
+        startPolling();
+      }
     }
+  };
+
+  let data;
+  try {
+    const resp = await fetch("/api/experiments", { method: "POST" });
+    if (!resp.ok) {
+      throw new Error("HTTP " + resp.status);
+    }
+    data = await resp.json();
+  } catch (e) {
+    failCreate(e.message);
     return;
   }
   if (gen !== expGen) return; // 期间又触发了新建 / 冻结
+  if (!data || !data.id) {
+    failCreate("响应缺少实验 ID");
+    return;
+  }
 
+  // 创建成功：从此刻起一切只围绕新 ID。creating 先复位，旧 ID 的迟到响应
+  // 因 gen 不匹配早已全部作废，不可能再影响下面的渲染 / 轮询。
+  creating = false;
   expId = data.id;
   history.replaceState(null, "", "?exp=" + expId);
   $("exp-id").textContent = expId;
@@ -143,19 +197,19 @@ function startPolling() {
   // 状态轮询只返回服务端内存状态，不执行任何 SELECT，不会提前建立快照
   statusTimer = setInterval(() => {
     const gen = expGen;
-    if (expFrozen) return;
+    if (creating || expFrozen) return;
     refreshStatus(gen).catch(() => {});
   }, 2000);
   committedTimer = setInterval(() => {
     const gen = expGen;
-    if (expFrozen) return;
+    if (creating || expFrozen) return;
     refreshCommitted(gen).catch(() => {});
   }, 2000);
 }
 
 async function refreshStatus(gen, opts = {}) {
   const allowAutoCreate = opts.allowAutoCreate !== false;
-  if (!expId || expFrozen) return;
+  if (!expId || creating || expFrozen) return;
   try {
     const data = await fetchJson(`/api/experiments/${expId}/status`);
     if (gen !== expGen || expFrozen) return;
@@ -182,7 +236,7 @@ async function refreshStatus(gen, opts = {}) {
 
 async function refreshCommitted(gen, opts = {}) {
   const allowAutoCreate = opts.allowAutoCreate !== false;
-  if (!expId || expFrozen) return;
+  if (!expId || creating || expFrozen) return;
   try {
     const data = await fetchJson(`/api/experiments/${expId}/committed`);
     if (gen !== expGen || expFrozen) return;
@@ -280,7 +334,7 @@ function clearError(side) {
 }
 
 async function doOp(side, op) {
-  if (expFrozen) return;
+  if (creating || expFrozen) return;
   const body = { op };
   if (op === "add") {
     const raw = $(`add-input-${side}`).value.trim();
@@ -348,7 +402,7 @@ function setCheckpointBusy(busy) {
 }
 
 async function doCheckpoint(mode) {
-  if (expFrozen) return;
+  if (creating || expFrozen) return;
   const gen = expGen;
   setCheckpointBusy(true);
   clearError("ckpt");
@@ -385,7 +439,7 @@ async function doCheckpoint(mode) {
 }
 
 async function deleteCurrentExperiment() {
-  if (!expId || expFrozen) return;
+  if (!expId || creating || expFrozen) return;
   const id = expId;
   const ok = window.confirm(
     `确认删除当前实验 ${id} ？\n\n` +
@@ -431,7 +485,7 @@ async function init() {
     deleteCurrentExperiment().catch(() => {});
   });
   $("refresh-committed").addEventListener("click", () => {
-    if (expFrozen) return;
+    if (creating || expFrozen) return;
     refreshCommitted(expGen).catch(() => {});
   });
   $("ckpt-passive").addEventListener("click", () => {
